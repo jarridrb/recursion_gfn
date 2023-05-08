@@ -74,6 +74,8 @@ class TrajectoryBalance:
         self.mask_invalid_rewards = False
         self.length_normalize_losses = False
         self.reward_normalize_losses = False
+        self.thompson_sampling_bootstrap = hps.get('do_thompson_sampling_bootstrap', False)
+        self.thompson_sampling_bootstrap_prob = hps.get('thompson_sampling_bootstrap_prob', 0.5)
         self.sample_temp = 1
         self.is_doing_subTB = hps.get('tb_do_subtb', False)
         self.correct_idempotent = hps.get('tb_correct_idempotent', False)
@@ -113,9 +115,9 @@ class TrajectoryBalance:
         dev = self.ctx.device
         cond_info = cond_info.to(dev)
         data = self.graph_sampler.sample_from_model(model, n, cond_info, dev, random_action_prob)
-        logZ_pred = model.logZ(cond_info)
-        for i in range(n):
-            data[i]['logZ'] = logZ_pred[i].item()
+        #logZ_pred = model.logZ(cond_info)
+        #for i in range(n):
+        #    data[i]['logZ'] = logZ_pred[i].item()
         return data
 
     def create_training_data_from_graphs(self, graphs):
@@ -245,7 +247,6 @@ class TrajectoryBalance:
         # i.e. the final graph of each trajectory
         log_reward_preds = per_mol_out[final_graph_idx, 0]
         # Compute trajectory balance objective
-        log_Z = model.logZ(cond_info)[:, 0]
         # Compute the log prob of each action in the trajectory
         if self.correct_idempotent:
             # If we want to correct for idempotent actions, we need to sum probabilities
@@ -267,13 +268,18 @@ class TrajectoryBalance:
             log_prob = fwd_cat.log_prob(batch.actions)
         # The log prob of each backward action
         log_p_B = batch.log_p_B
-        assert log_prob.shape == log_p_B.shape
+        assert log_prob.shape == log_p_B.shape or log_prob.shape[1] == log_p_B.shape[0]
         # Clip rewards
         assert log_rewards.ndim == 1
         clip_log_R = torch.maximum(log_rewards, torch.tensor(self.illegal_action_logreward, device=dev))
         # This is the log probability of each trajectory
-        traj_log_prob = scatter(log_prob, batch_idx, dim=0, dim_size=num_trajs, reduce='sum')
+        traj_log_prob = scatter(log_prob, batch_idx, dim=len(log_prob.shape) - 1, dim_size=num_trajs, reduce='sum')
         # Compute log numerator and denominator of the TB objective
+        log_Z = model.logZ(cond_info)
+        if len(log_prob.shape) == 1:
+            log_Z = log_Z[:, 0]
+
+        log_Z = log_Z.T
         numerator = log_Z + traj_log_prob
         denominator = clip_log_R + scatter(log_p_B, batch_idx, dim=0, dim_size=num_trajs, reduce='sum')
 
@@ -290,6 +296,9 @@ class TrajectoryBalance:
             # logprobablity of this trajetcory is it should be smaller
             # (thus the `numerator - 1`). Why 1? Intuition?
             denominator = denominator * (1 - invalid_mask) + invalid_mask * (numerator.detach() - 1)
+
+        if len(numerator.shape) == 2:
+            denominator = denominator.unsqueeze(0)
 
         if self.is_doing_subTB:
             # SubTB interprets the per_mol_out predictions to predict the state flow F(s)
@@ -329,7 +338,19 @@ class TrajectoryBalance:
         else:
             reward_loss = 0
 
+        if self.thompson_sampling_bootstrap:
+            uniform_samples = torch.rand(traj_losses.shape, device=traj_losses.device)
+            should_zero_loss = uniform_samples <= self.thompson_sampling_bootstrap_prob
+            traj_losses = should_zero_loss * traj_losses
+
         loss = traj_losses.mean() + reward_loss * self.reward_loss_multiplier
+
+        mean_traj_log_prob = traj_log_prob
+        var_traj_log_prob = traj_log_prob
+        if traj_log_prob.ndim == 2:
+            mean_traj_log_prob = traj_log_prob.mean(0)
+            var_traj_log_prob = traj_log_prob.var(0)
+
         info = {
             'offline_loss': traj_losses[:batch.num_offline].mean() if batch.num_offline > 0 else 0,
             'online_loss': traj_losses[batch.num_offline:].mean() if batch.num_online > 0 else 0,
@@ -337,6 +358,12 @@ class TrajectoryBalance:
             'invalid_trajectories': invalid_mask.sum() / batch.num_online if batch.num_online > 0 else 0,
             'invalid_logprob': (invalid_mask * traj_log_prob).sum() / (invalid_mask.sum() + 1e-4),
             'invalid_losses': (invalid_mask * traj_losses).sum() / (invalid_mask.sum() + 1e-4),
+            'traj_log_prob_mean': mean_traj_log_prob.mean().item(),
+            'traj_log_prob_min': mean_traj_log_prob.min().item(),
+            'traj_log_prob_max': mean_traj_log_prob.max().item(),
+            'traj_log_prob_var_mean': var_traj_log_prob.mean().item(),
+            'traj_log_prob_var_min': var_traj_log_prob.min().item(),
+            'traj_log_prob_var_max': var_traj_log_prob.max().item(),
             'logZ': log_Z.mean(),
             'loss': loss.item(),
         }

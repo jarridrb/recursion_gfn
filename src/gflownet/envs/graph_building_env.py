@@ -404,7 +404,7 @@ class GraphActionCategorical:
            mask out logits of invalid actions
         """
         self.num_graphs = graphs.num_graphs
-        assert all([i.ndim == 2 for i in logits])
+        assert all([i.ndim in [2, 3] for i in logits])
         assert len(logits) == len(types) == len(keys)
         if masks is not None:
             assert len(logits) == len(masks)
@@ -474,16 +474,16 @@ class GraphActionCategorical:
         # compute max
         maxl = torch.cat(
             [scatter(i, b, dim=0, dim_size=self.num_graphs, reduce='max') for i, b in zip(self.logits, self.batch)],
-            dim=1).max(1).values.detach()
+            dim=-1).max(-1).values.detach()
         # substract by max then take exp
         # x[b, None] indexes by the batch to map back to each node/edge and adds a broadcast dim
-        exp_logits = [(i - maxl[b, None]).exp().clamp(self._epsilon) for i, b in zip(self.logits, self.batch)]
+        exp_logits = [(i - maxl[b, ..., None]).exp().clamp(self._epsilon) for i, b in zip(self.logits, self.batch)]
         # sum corrected exponentiated logits, to get log(Z - max) = log(sum(exp(logits)) - max)
         logZ = sum([
-            scatter(i, b, dim=0, dim_size=self.num_graphs, reduce='sum').sum(1) for i, b in zip(exp_logits, self.batch)
+            scatter(i, b, dim=0, dim_size=self.num_graphs, reduce='sum').sum(-1) for i, b in zip(exp_logits, self.batch)
         ]).log()
         # log probabilities is log(exp(logit) / Z)
-        self.logprobs = [i.log() - logZ[b, None] for i, b in zip(exp_logits, self.batch)]
+        self.logprobs = [i.log() - logZ[b, ..., None] for i, b in zip(exp_logits, self.batch)]
         return self.logprobs
 
     def logsumexp(self, x=None):
@@ -617,10 +617,16 @@ class GraphActionCategorical:
         # To index the log probabilities efficiently, we will ravel the array, and compute the
         # indices of the raveled actions.
         # First, flatten and cat:
-        all_logprobs = torch.cat([i.flatten() for i in logprobs])
+        if len(logprobs[0].shape) == 3:
+            all_logprobs = torch.cat([i.permute(1, 0, 2).flatten(1) for i in logprobs], dim=1)
+        else:
+            all_logprobs = torch.cat([i.flatten() for i in logprobs])
         # The action type offset depends on how many elements each logit group has, and we retrieve by
         # the type index 0:
-        t_offsets = torch.tensor([0] + [i.numel() for i in logprobs], device=self.dev).cumsum(0)[actions[:, 0]]
+        if len(logprobs[0].shape) == 3:
+            t_offsets = torch.tensor([0] + [i[:, 0].numel() for i in logprobs], device=self.dev).cumsum(0)[actions[:, 0]]
+        else:
+            t_offsets = torch.tensor([0] + [i.numel() for i in logprobs], device=self.dev).cumsum(0)[actions[:, 0]]
         # The row offset depends on which row the graph's corresponding logits start (since they are
         # all concatenated together). This is stored in self.slice; each logit group has its own
         # slice tensor of shape N+1 (since the 0th entry is always 0).
@@ -630,14 +636,19 @@ class GraphActionCategorical:
         graph_row_offsets = torch.cat(self.slice)[actions[:, 0] * (N + 1) + batch]
         # Now we add the row value. To do that we need to know the number of elements of each row in
         # the flattened array, this is simply i.shape[1].
-        row_lengths = torch.tensor([i.shape[1] for i in logprobs], device=self.dev)
+        row_lengths = torch.tensor([i.shape[-1] for i in logprobs], device=self.dev)
         # Now we can multiply the length of the row for each type t by the actual row index,
         # offsetting by the row at which each graph's logits start.
         row_offsets = row_lengths[actions[:, 0]] * (actions[:, 1] + graph_row_offsets)
         # This is the last index in the raveled tensor, therefore the offset is just the column value
         col_offsets = actions[:, 2]
         # Index the flattened array
-        return all_logprobs[t_offsets + row_offsets + col_offsets]
+        logprob_idxs = t_offsets + row_offsets + col_offsets
+        if len(logprobs[0].shape) == 3:
+            logprob_idxs = logprob_idxs.unsqueeze(0).repeat(all_logprobs.shape[0], 1)
+            return all_logprobs.gather(dim=1, index=logprob_idxs)
+        else:
+            return all_logprobs[logprob_idxs]
 
     def entropy(self, logprobs=None):
         """The entropy for each graph categorical in the batch

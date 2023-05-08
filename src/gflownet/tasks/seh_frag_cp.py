@@ -424,7 +424,7 @@ def main():
                 group='ts_tuning_seh_frag',
                 dir='~/scratch/wandb',
                 log_config=True,
-                settings=wandb.Settings(start_method='fork')
+                settings=wandb.Settings(start_method='thread')
             )]
         ),
         tune_config=tune.TuneConfig(

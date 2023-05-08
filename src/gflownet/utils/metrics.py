@@ -509,7 +509,9 @@ def compute_diverse_top_k(smiles, rewards, k, thresh=0.7):
         if len(modes) >= k:
             # last_idx = i
             break
-    return np.mean([i[0] for i in modes])  # return sim
+
+    ret_modes = list(map(lambda x: (torch.tensor(x[0]), x[1]), modes))
+    return np.mean([i[0] for i in modes]), ret_modes  # return sim
 
 
 def get_topk(rewards, k):

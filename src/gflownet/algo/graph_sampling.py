@@ -6,6 +6,7 @@ from torch import Tensor
 import torch.nn as nn
 
 from gflownet.envs.graph_building_env import GraphActionType
+from gflownet.models.graph_transformer import ThompsonSamplingGraphTransformerGFN
 
 
 class GraphSampler:
@@ -72,6 +73,10 @@ class GraphSampler:
         graphs = [self.env.new() for i in range(n)]
         done = [False] * n
 
+        is_ts_model = isinstance(model, ThompsonSamplingGraphTransformerGFN)
+        if is_ts_model:
+            model.sample_thompson_sampling_indices(n)
+
         def not_done(lst):
             return [e for i, e in enumerate(lst) if not done[i]]
 
@@ -80,7 +85,11 @@ class GraphSampler:
             torch_graphs = [self.ctx.graph_to_Data(i) for i in not_done(graphs)]
             not_done_mask = torch.tensor(done, device=dev).logical_not()
             # Forward pass to get GraphActionCategorical
-            fwd_cat, log_reward_preds = model(self.ctx.collate(torch_graphs).to(dev), cond_info[not_done_mask])
+            args = [self.ctx.collate(torch_graphs).to(dev), cond_info[not_done_mask]]
+            if is_ts_model:
+                args.append(not_done_mask.nonzero().squeeze())
+
+            fwd_cat, log_reward_preds = model(*args)
             if random_action_prob > 0:
                 masks = [1] * len(fwd_cat.logits) if fwd_cat.masks is None else fwd_cat.masks
                 # Device which graphs in the minibatch will get their action randomized
@@ -136,6 +145,9 @@ class GraphSampler:
                     data[i]['is_valid'] = False
             if all(done):
                 break
+
+        if is_ts_model:
+            model.unset_thompson_sampling_indices()
 
         for i in range(n):
             # If we're not bootstrapping, we could query the reward

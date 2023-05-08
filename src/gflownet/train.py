@@ -8,6 +8,7 @@ from torch import Tensor
 import torch.nn as nn
 from torch.utils.data import DataLoader
 from torch.utils.data import Dataset
+from ray.tune import Trainable
 import torch.utils.tensorboard
 import torch_geometric.data as gd
 
@@ -83,8 +84,8 @@ class GFNTask:
         raise NotImplementedError()
 
 
-class GFNTrainer:
-    def __init__(self, hps: Dict[str, Any], device: torch.device):
+class GFNTrainer(Trainable):
+    def setup(self, hps: Dict[str, Any]):
         """A GFlowNet trainer. Contains the main training loop in `run` and should be subclassed.
 
         Parameters
@@ -109,7 +110,7 @@ class GFNTrainer:
 
         # Override default hyperparameters with the constructor arguments
         self.hps = {**self.default_hps(), **hps}
-        self.device = device
+        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         # The number of processes spawned to sample object and do CPU work
         self.num_workers: int = self.hps.get('num_data_loader_workers', 0)
         # The ratio of samples drawn from `self.training_data` during training. The rest is drawn from
@@ -125,15 +126,27 @@ class GFNTrainer:
         # Will check if parameters are finite at every iteration (can be costly)
         self._validate_parameters = False
 
-        self.setup()
+        self._setup()
+
+        self.model.to(self.device)
+        self.sampling_model.to(self.device)
+
+        self.logger = create_logger(logfile='train.log')
+        self.epoch_length = max(len(self.training_data), 1)
+        self.train_dl = self.build_training_data_loader()
+        self.valid_dl = self.build_validation_data_loader()
+        self.callbacks = self.build_callbacks()
+
+        start = self.hps.get('start_at_step', 0) + 1
+        self.iterator = zip(range(start, 1 + self.hps['num_training_steps']), cycle(self.train_dl))
 
     def default_hps(self) -> Dict[str, Any]:
         raise NotImplementedError()
 
-    def setup(self):
+    def _setup(self):
         raise NotImplementedError()
 
-    def step(self, loss: Tensor):
+    def _loss_step(self, loss: Tensor):
         raise NotImplementedError()
 
     def _wrap_model_mp(self, model):
@@ -173,7 +186,7 @@ class GFNTrainer:
             loss, info = self.algo.compute_batch_losses(self.model, batch)
             if not torch.isfinite(loss):
                 raise ValueError('loss is not finite')
-            step_info = self.step(loss)
+            step_info = self._loss_step(loss)
             if self._validate_parameters and not all([torch.isfinite(i).all() for i in self.model.parameters()]):
                 raise ValueError('parameters are not finite')
         except ValueError as e:
@@ -185,13 +198,44 @@ class GFNTrainer:
             info.update(step_info)
         if hasattr(batch, 'extra_info'):
             info.update(batch.extra_info)
+        info.update(self._get_log_info(batch, info))
         return {k: v.item() if hasattr(v, 'item') else v for k, v in info.items()}
+
+    def _get_log_info(self, batch, info):
+        return {}
 
     def evaluate_batch(self, batch: gd.Batch, epoch_idx: int = 0, batch_idx: int = 0) -> Dict[str, Any]:
         loss, info = self.algo.compute_batch_losses(self.model, batch)
         if hasattr(batch, 'extra_info'):
             info.update(batch.extra_info)
         return {k: v.item() if hasattr(v, 'item') else v for k, v in info.items()}
+
+    def step(self):
+        try:
+            it, batch = next(self.iterator)
+        except StopIteration:
+            return {}
+
+        epoch_idx = it // self.epoch_length
+        batch_idx = it % self.epoch_length
+        info = self.train_batch(batch.to(self.device), epoch_idx, batch_idx)
+        self.log(info, it, 'train')
+        if self.verbose:
+            self.logger.info(f"iteration {it} : " + ' '.join(f'{k}:{v:.2f}' for k, v in info.items()))
+
+        if it % self.hps['validate_every'] == 0:
+            for batch in self.valid_dl:
+                info = self.evaluate_batch(batch.to(self.device), epoch_idx, batch_idx)
+                self.log(info, it, 'valid')
+                self.logger.info(f"validation - iteration {it} : " + ' '.join(f'{k}:{v:.2f}' for k, v in info.items()))
+            end_metrics = {}
+            for c in self.callbacks.values():
+                if hasattr(c, 'on_validation_end'):
+                    c.on_validation_end(end_metrics)
+            self.log(end_metrics, it, 'valid_end')
+            self._save_state(it)
+
+        return info
 
     def run(self, logger=None):
         """Trains the GFN for `num_training_steps` minibatches, performing
@@ -240,6 +284,9 @@ class GFNTrainer:
             self._summary_writer = torch.utils.tensorboard.SummaryWriter(self.hps['log_dir'])
         for k, v in info.items():
             self._summary_writer.add_scalar(f'{key}_{k}', v, index)
+
+    def save_checkpoint(self, dir_path):
+        pass
 
 
 def cycle(it):
