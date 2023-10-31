@@ -41,7 +41,7 @@ class ESMRewardModelWrapper(Designer):
             if not AA in _SUPPRESS_AAS
         )
 
-        self.device = get_device()
+        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         self._init_models()
 
 class ESMLogLikelihoodTask(GFNTask):
@@ -184,7 +184,7 @@ class ESMLogLikelihoodTrainer(StandardOnlineTrainer):
 def main():
     """Example of how this model can be run outside of Determined"""
     hps = {
-        "log_dir": "./logs/debug_run_toy_seq",
+        "log_dir": "./logs/debug_run_esm",
         "device": "cuda",
         "overwrite_existing_exp": True,
         "num_training_steps": 2_000,
@@ -206,7 +206,7 @@ def main():
             raise ValueError(f"Log dir {hps['log_dir']} already exists. Set overwrite_existing_exp=True to delete it.")
     os.makedirs(hps["log_dir"])
 
-    trial = ToySeqTrainer(hps)
+    trial = ESMLogLikelihoodTrainer(hps)
     trial.print_every = 1
     trial.run()
 
