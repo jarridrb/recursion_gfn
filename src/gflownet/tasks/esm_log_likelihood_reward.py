@@ -1,13 +1,23 @@
 from esm_reward.lm_design import Designer
-from dreamfold.utils.vocabs import AMINO_ACID_VOCAB
 from pathlib import Path
-from typing import Dict, Tuple
+from typing import Dict, Tuple, List
 from copy import deepcopy
 from torch.utils.data import TensorDataset
-from transformers import AutoTokenizer
+from torchtyping import TensorType
 import torch.nn.functional as F
 import pandas as pd
+import numpy as np
+import shutil
+import socket
 import torch
+import os
+
+from gflownet.config import Config
+from gflownet.envs.seq_building_env import AutoregressiveSeqBuildingContext, SeqBuildingEnv
+from gflownet.models.seq_transformer import SeqTransformerGFN
+from gflownet.online_trainer import StandardOnlineTrainer
+from gflownet.trainer import FlatRewards, GFNTask, RewardScalar
+from gflownet.utils.conditioning import TemperatureConditional
 
 AMINO_ACID_VOCAB = list('ILVAGMFYWEDQNHCRKSTP')
 _vocab = deepcopy(AMINO_ACID_VOCAB)
@@ -15,6 +25,9 @@ _vocab.remove('C')
 
 _REPO_IDX_TO_CHAR = {idx: char for idx, char in enumerate(_vocab)}
 _SUPPRESS_AAS = {'C'}
+
+def get_device():
+    return torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 def _expand_states(states, padding_token, eos_token):
     actions, seqs = [], []
@@ -51,13 +64,14 @@ class ESMLogLikelihoodTask(GFNTask):
         rng: np.random.Generator
     ):
         self.temperature_conditional = TemperatureConditional(cfg, rng)
+        self.num_cond_dim = self.temperature_conditional.encoding_size()
 
         self.esm_reward_calculator = ESMRewardModelWrapper()
 
-        self.language_model_energy_term_weight = cfg.task.language_model_energy_term_weight
+        self.language_model_energy_term_weight = cfg.task.esm_log_likelihood.language_model_energy_term_weight
 
-        self.ngram_energy_term_weight = cfg.task.ngram_energy_term_weight
-        self.ngram_orders = cfg.task.ngram_orders
+        self.ngram_energy_term_weight = cfg.task.esm_log_likelihood.ngram_energy_term_weight
+        self.ngram_orders = cfg.task.esm_log_likelihood.ngram_orders
 
         self.all_esm_toks = self.esm_reward_calculator.vocab.all_toks
         self.esm_vocab_char_to_idx = {
@@ -66,14 +80,14 @@ class ESMLogLikelihoodTask(GFNTask):
             if char in self.esm_reward_calculator.allowed_AA
         }
 
-    def sample_conditional_information(self, n: int, train_it: int) -> Dict[str, Tensor]:
+    def sample_conditional_information(self, n: int, train_it: int) -> Dict[str, torch.Tensor]:
         return self.temperature_conditional.sample(n)
 
-    def cond_info_to_logreward(self, cond_info: Dict[str, Tensor], flat_reward: FlatRewards) -> RewardScalar:
+    def cond_info_to_logreward(self, cond_info: Dict[str, torch.Tensor], flat_reward: FlatRewards) -> RewardScalar:
         return RewardScalar(self.temperature_conditional.transform(cond_info, flat_reward))
 
-    def compute_flat_rewards(self, objs: List[str]) -> Tuple[FlatRewards, Tensor]:
-        log_rewards = self.get_log_reward(objs)
+    def compute_flat_rewards(self, objs: List[str]) -> Tuple[FlatRewards, torch.Tensor]:
+        log_rewards = self.get_log_rewards(objs)
 
         return FlatRewards(log_rewards[:, None]), torch.ones(len(objs), dtype=torch.bool)
 
@@ -94,10 +108,13 @@ class ESMLogLikelihoodTask(GFNTask):
             for seq in sequences
         ]
 
-        int_esm_encoded_seqs = torch.tensor([
-            [convert(tkn) for tkn in seq if is_valid(tkn)]
-            for seq in sequences
-        ]).to(device=get_device())
+        int_esm_encoded_seqs = torch.tensor(
+            [
+                [convert(tkn) for tkn in seq if is_valid(tkn)]
+                for seq in sequences
+            ],
+            device=get_device()
+        )
 
         return F.one_hot(int_esm_encoded_seqs, len(self.all_esm_toks)).float()
 
@@ -149,10 +166,6 @@ class ESMLogLikelihoodTrainer(StandardOnlineTrainer):
         cfg.algo.tb.Z_lr_decay = 50_000
         cfg.algo.tb.do_parameterize_p_b = False
 
-        cfg.task.language_model_energy_term_weight = 1.0
-        cfg.task.ngram_energy_term_weight = 0.5
-        cfg.task.ngram_orders = [1, 2, 3]
-
     def setup_model(self):
         self.model = SeqTransformerGFN(
             self.ctx,
@@ -161,7 +174,6 @@ class ESMLogLikelihoodTrainer(StandardOnlineTrainer):
 
     def setup_task(self):
         self.task = ESMLogLikelihoodTask(
-            ["aa", "bb", "cc"],
             cfg=self.cfg,
             rng=self.rng,
         )

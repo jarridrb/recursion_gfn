@@ -58,7 +58,15 @@ class QM9TaskConfig:
 
 
 @dataclass
+class ESMLogLikelihoodConfig:
+    language_model_energy_term_weight: float = 1.0
+    ngram_energy_term_weight: float = 0.5
+    ngram_orders: Tuple[int] = (1, 2, 3)
+
+
+@dataclass
 class TasksConfig:
     qm9: QM9TaskConfig = QM9TaskConfig()
     seh: SEHTaskConfig = SEHTaskConfig()
     seh_moo: SEHMOOTaskConfig = SEHMOOTaskConfig()
+    esm_log_likelihood: ESMLogLikelihoodConfig = ESMLogLikelihoodConfig()
